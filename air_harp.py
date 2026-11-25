@@ -710,7 +710,7 @@ def open_camera(index, fast_mode=True):
     return CameraFeed(camera)
 
 
-def run(harp, camera_index, demo, fullscreen=True):
+def run(harp, camera_index, demo, fullscreen=True, log_path=None):
     feed = None
     detector = None
     try:
@@ -729,11 +729,25 @@ def run(harp, camera_index, demo, fullscreen=True):
         lock = Lock()
         shared = {"viewport": (0, 0, WIDTH, HEIGHT), "tracked": 0, "demo": demo}
 
+        log = open(log_path, "w", buffering=1) if log_path else None
+        if log:
+            log.write("captured,handled,hands,raw_detections,tip_x,tip_y,pinched,strikes\n")
+
         def on_tracked(captured_at, result):
             with lock:
                 shared["tracked"] += 1
                 if not shared["demo"]:
                     harp.update_hands(result, captured_at, shared["viewport"])
+                if log:
+                    hand = harp.hands.get(0) or next(iter(harp.hands.values()), None)
+                    tip = hand.tip if hand else ("", "")
+                    strikes = sum(s.struck_at == captured_at for s in harp.strings)
+                    log.write(f"{captured_at:.4f},{monotonic():.4f},{len(harp.hands)},"
+                              f"{len(result.hand_landmarks)},{tip[0]:.0f},{tip[1]:.0f},"
+                              f"{int(bool(hand and hand.pinched))},{strikes}\n"
+                              if hand else
+                              f"{captured_at:.4f},{monotonic():.4f},0,"
+                              f"{len(result.hand_landmarks)},,,0,0\n")
 
         def on_mouse(event, x, y, flags, mouse_demo):
             with lock:
@@ -793,6 +807,8 @@ def run(harp, camera_index, demo, fullscreen=True):
                 elapsed = now - measured_at
                 rates = (f"Cam {camera_frames / elapsed:.0f}  Track {tracking_frames / elapsed:.0f}  "
                          f"View {view_frames / elapsed:.0f} fps") if not demo else ""
+                if log and rates:
+                    log.write(f"# {now:.4f} {rates}\n")
                 measured_at = now
                 camera_frames = tracking_frames = view_frames = 0
             frame = background.copy()
@@ -839,13 +855,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", default=0, type=int, help="Webcam index (default: 0)")
     parser.add_argument("--demo", action="store_true", help="Play with the mouse without a webcam")
-    parser.add_argument("--windowed", action="store_true", help="Start in a resizable window")
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="Start fullscreen (default: resizable window)")
+    parser.add_argument("--log", help="Write one CSV row per tracking result to this file")
     args = parser.parse_args()
     audio = Audio()
     try:
         harp = Harp(audio)
         harp.load_pirate_notes()
-        run(harp, args.camera, args.demo, fullscreen=not args.windowed)
+        run(harp, args.camera, args.demo, fullscreen=args.fullscreen, log_path=args.log)
     except (RuntimeError, cv2.error) as error:
         parser.exit(1, f"Air Harp: {error}\n")
     except KeyboardInterrupt:
