@@ -188,7 +188,9 @@ class String:
         self.note = note_for_length(distance_between(self.a, self.b))
 
     def strike(self, now, audio, contact=0.5, direction=1):
-        if now - self.struck_at >= 0.14:
+        # The cooldown only stops jitter re-hitting in the same direction; a strum
+        # coming back the other way always sounds.
+        if direction != self.direction or now - self.struck_at >= 0.14:
             self.struck_at = now
             self.contact = contact
             self.direction = direction
@@ -405,7 +407,9 @@ class Harp:
 
         for slot, hand in hands.items():
             previous = recent.get(slot)
-            if previous and not previous.pinched and not hand.pinched:
+            # Drawing (preview) and endpoint drags already return above; a curled
+            # strumming hand often reads as pinched, so pinch alone must not block.
+            if previous and self.preview is None:
                 self.pluck(previous.tip, hand.tip, now)
 
     def expire_tracking(self, now):

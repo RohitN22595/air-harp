@@ -37,8 +37,23 @@ assert sweep([(0.0, frame(0.40)), (0.2, frame(0.60))]), "gap in tracking lost th
 assert sweep([(0.0, frame(0.40)), (0.033, frame(0.47, pinch=True)), (0.066, frame(0.60))]), \
     "one-frame pinch blocked the pluck"
 
-# A held pinch still blocks plucking (it is a drawing gesture).
-assert not sweep([(0.0, frame(0.40, True)), (0.033, frame(0.47, True)), (0.066, frame(0.60, True))]), \
-    "held pinch plucked"
+# A curled strumming hand that reads as pinched still plucks.
+assert sweep([(0.0, frame(0.40, True)), (0.033, frame(0.47, True)), (0.066, frame(0.60, True))]), \
+    "pinch-looking strum was blocked"
+
+# Fast back-and-forth strum: down then up 66 ms later must sound twice.
+assert len(sweep([(0.0, frame(0.40)), (0.033, frame(0.60)), (0.066, frame(0.66)),
+                  (0.099, frame(0.40))])) == 2, "return stroke swallowed by cooldown"
+
+
+def two_hands(y, pinch):
+    left, right = frame(y, pinch).hand_landmarks[0], frame(y, pinch).hand_landmarks[0]
+    right = [type(p)(x=p.x + 0.3, y=p.y) for p in right]
+    return type(frame(y))(hand_landmarks=[left, right])
+
+
+# Drawing a string (both hands pinched) moves across strings without plucking them.
+assert not sweep([(0.0, two_hands(0.40, True)), (0.033, two_hands(0.47, True)),
+                  (0.066, two_hands(0.60, True))]), "drawing gesture plucked"
 
 print("ok")
