@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from itertools import cycle
 from math import exp, hypot, sin, tau
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep
 
 import cv2
@@ -120,6 +120,7 @@ class CameraFeed:
 
     def __init__(self, capture):
         self.capture = capture
+        self.on_frame = None  # Called on this thread, so tracking never waits for rendering.
         self.latest = None
         self.failed = False
         self.stop = Event()
@@ -134,8 +135,11 @@ class CameraFeed:
                 ok, image = self.capture.read()
                 if ok:
                     sequence += 1
-                    self.latest = (sequence, monotonic(), image)
+                    captured_at = monotonic()
+                    self.latest = (sequence, captured_at, image)
                     missed = 0
+                    if self.on_frame is not None:
+                        self.on_frame(image, captured_at)
                 elif missed >= 9:
                     break
                 else:
@@ -195,6 +199,7 @@ class String:
 class Hand:
     points: tuple[Point, ...]
     pinched: bool
+    raw_pinch: bool = False  # This frame alone looks pinched; confirmed on the next one.
 
     @property
     def tip(self):
@@ -260,7 +265,7 @@ class Harp:
             return
         hits = []
         for string in self.strings:
-            if string.phrase_step is None and distance > WIDTH * 0.20:
+            if string.phrase_step is None and distance > WIDTH * 0.45:
                 continue
             intersection = crossing(start, end, string.a, string.b)
             if intersection is None:
@@ -336,9 +341,10 @@ class Harp:
             for landmarks in result.hand_landmarks
         ]
         # Keep wrist identities through brief missed frames without drawing stale joints.
+        # Fast sweeps blur the hand out for a few frames; the bridge keeps those plucks.
         self.recent_hands = {
             slot: (seen, hand) for slot, (seen, hand) in self.recent_hands.items()
-            if now - seen <= 0.13
+            if now - seen <= 0.3
         }
         recent = {slot: hand for slot, (_, hand) in self.recent_hands.items()}
         slots = assign_hands(detections, recent)
@@ -355,7 +361,10 @@ class Harp:
                     (px + (x - px) * weight, py + (y - py) * weight)
                     for (px, py), (x, y) in zip(previous.points, points)
                 )
-            hands[slot] = Hand(points, palm > 0 and gap < palm * threshold)
+            raw = palm > 0 and gap < palm * threshold
+            # One pinched-looking frame mid-sweep must not swallow a pluck.
+            confirmed = raw and previous is not None and (previous.pinched or previous.raw_pinch)
+            hands[slot] = Hand(points, confirmed, raw)
 
         self.update_gestures(hands, now, recent)
         self.hands = hands
@@ -565,25 +574,28 @@ def write(frame, words, origin, size=0.52, color=(226, 233, 245)):
 
 
 def render(frame, harp, now, demo, rates=""):
-    for string in harp.strings:
-        active_end = harp.drag.end if harp.drag and harp.drag.string is string else None
+    # The tracking thread mutates the harp; draw from one snapshot of it.
+    strings, hands = list(harp.strings), list(harp.hands.values())
+    drag, preview = harp.drag, harp.preview
+    for string in strings:
+        active_end = drag.end if drag and drag.string is string else None
         age = now - string.struck_at if active_end is None else None
         draw_string(frame, string.a, string.b, string.color, now, age,
                     string.contact, string.direction, active_end)
-    if harp.preview is not None:
-        a, b = harp.preview
+    if preview is not None:
+        a, b = preview
         draw_string(frame, a, b, (186, 191, 130), now)
 
-    for hand in harp.hands.values():
+    for hand in hands:
         draw_hand(frame, hand)
-    for string in harp.strings:
-        editing_b = harp.drag and harp.drag.string is string and harp.drag.end == 1
+    for string in strings:
+        editing_b = drag and drag.string is string and drag.end == 1
         draw_note(frame, string.b if editing_b else string.a, string.note,
                   beside_endpoint=string.phrase_step is not None and not editing_b)
-    if harp.preview is not None:
-        length = distance_between(*harp.preview)
+    if preview is not None:
+        length = distance_between(*preview)
         if length >= MIN_STRING:
-            draw_note(frame, harp.preview[1], note_for_length(length))
+            draw_note(frame, preview[1], note_for_length(length))
 
     top, bottom = frame[:88], frame[-60:]
     cv2.convertScaleAbs(top, dst=top, alpha=0.42)
@@ -596,8 +608,8 @@ def render(frame, harp, now, demo, rates=""):
     if show_phrase:
         write(frame, "He's a Pirate   /   Sweep down the middle and stop in any gap",
               (260, 70), 0.68, (255, 233, 168))
-    tracking = "Mouse mode" if demo else f"Hands {len(harp.hands)}/2"
-    if not demo and not harp.hands:
+    tracking = "Mouse mode" if demo else f"Hands {len(hands)}/2"
+    if not demo and not hands:
         tracking += "  /  Show your palm and wrist"
     write_right(frame, tracking, 37 if rates else 53)
     if rates:
@@ -605,7 +617,7 @@ def render(frame, harp, now, demo, rates=""):
     write(frame, "P  Pirate strings     F  Fullscreen     Z  Undo     C  Clear     Esc  Quit",
           (36, HEIGHT - 22), 0.73)
     sound = "" if harp.audio.stream is not None else "  /  Audio unavailable"
-    write_right(frame, f"E2-E6 chromatic  /  {len(harp.strings)} strings{sound}", HEIGHT - 22)
+    write_right(frame, f"E2-E6 chromatic  /  {len(strings)} strings{sound}", HEIGHT - 22)
 
 
 def draw_note(frame, anchor, note, *, beside_endpoint=False):
@@ -642,14 +654,15 @@ def camera_preview(image, viewport):
     return frame
 
 
-def create_tracker(results):
+def create_tracker(handle):
+    """Run hand tracking; `handle(captured_at, result)` fires on MediaPipe's thread."""
     import mediapipe as mp
 
     if not MODEL.is_file():
         raise RuntimeError(f"Missing hand tracking model: {MODEL}. See README.md for setup.")
 
     def on_result(result, _image, timestamp):
-        results.append((timestamp / 1000, result))
+        handle(timestamp / 1000, result)
 
     vision = mp.tasks.vision
     options = vision.HandLandmarkerOptions(
@@ -657,11 +670,30 @@ def create_tracker(results):
         running_mode=vision.RunningMode.LIVE_STREAM,
         num_hands=2,
         min_hand_detection_confidence=0.35,
-        min_hand_presence_confidence=0.35,
-        min_tracking_confidence=0.45,
+        min_hand_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
         result_callback=on_result,
     )
     return vision.HandLandmarker.create_from_options(options), mp
+
+
+def frame_tracker(detector, mp, shared):
+    """Feed each camera frame to the detector straight from the camera thread."""
+    last_timestamp = -1
+
+    def track(image, captured_at):
+        nonlocal last_timestamp
+        height, width = image.shape[:2]
+        shared["viewport"] = fit_camera_view(width, height)
+        scale = min(1, 640 / max(width, height))
+        small = cv2.resize(image, (round(width * scale), round(height * scale)),
+                           interpolation=cv2.INTER_AREA) if scale < 1 else image
+        rgb = cv2.cvtColor(cv2.flip(small, 1), cv2.COLOR_BGR2RGB)
+        last_timestamp = max(last_timestamp + 1, int(captured_at * 1000))
+        detector.detect_async(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
+                              last_timestamp)
+
+    return track
 
 
 def open_camera(index, fast_mode=True):
@@ -692,16 +724,30 @@ def run(harp, camera_index, demo, fullscreen=True):
             if feed is None:
                 demo = True
                 print(f"Webcam {camera_index} unavailable. Starting mouse mode.")
-        results = deque(maxlen=8)
-        if feed is not None:
-            detector, mp = create_tracker(results)
+        # Plucks fire on MediaPipe's thread the moment a result lands; the lock keeps
+        # them from interleaving with keyboard, mouse and timeout updates.
+        lock = Lock()
+        shared = {"viewport": (0, 0, WIDTH, HEIGHT), "tracked": 0, "demo": demo}
 
-        cv2.setMouseCallback(WINDOW, harp.mouse_event, demo)
+        def on_tracked(captured_at, result):
+            with lock:
+                shared["tracked"] += 1
+                if not shared["demo"]:
+                    harp.update_hands(result, captured_at, shared["viewport"])
+
+        def on_mouse(event, x, y, flags, mouse_demo):
+            with lock:
+                harp.mouse_event(event, x, y, flags, mouse_demo)
+
+        if feed is not None:
+            detector, mp = create_tracker(on_tracked)
+            feed.on_frame = frame_tracker(detector, mp, shared)
+
+        cv2.setMouseCallback(WINDOW, on_mouse, demo)
 
         background = np.full((HEIGHT, WIDTH, 3), (39, 24, 22), dtype=np.uint8)
         viewport = (0, 0, WIDTH, HEIGHT)
         last_sequence = None
-        last_timestamp = -1
         measured_at = monotonic()
         camera_frames = tracking_frames = view_frames = 0
         rates = ""
@@ -713,15 +759,18 @@ def run(harp, camera_index, demo, fullscreen=True):
                 feed.close()
                 feed = open_camera(camera_index, fast_mode=False) if retry_default else None
                 tried_default_camera_mode = True
-                if feed is None:
+                if feed is not None:
+                    feed.on_frame = frame_tracker(detector, mp, shared)
+                else:
                     print(f"Webcam {camera_index} stopped supplying frames. Starting mouse mode.")
                     detector.close()
                     detector = None
-                    harp.reset_tracking(monotonic())
-                    demo = True
+                    with lock:
+                        shared["demo"] = demo = True
+                        harp.reset_tracking(monotonic())
                     background.fill(24)
                     rates = ""
-                    cv2.setMouseCallback(WINDOW, harp.mouse_event, True)
+                    cv2.setMouseCallback(WINDOW, on_mouse, True)
 
             latest = feed.latest if feed is not None else None
             if latest is not None and latest[0] != last_sequence:
@@ -733,22 +782,13 @@ def run(harp, camera_index, demo, fullscreen=True):
                 height, width = image.shape[:2]
                 viewport = fit_camera_view(width, height)
                 background = camera_preview(image, viewport)
-                scale = min(1, 800 / max(width, height))
-                tracking = cv2.resize(image, (round(width * scale), round(height * scale)),
-                                      interpolation=cv2.INTER_AREA) if scale < 1 else image
-                rgb = cv2.cvtColor(tracking, cv2.COLOR_BGR2RGB)
-                last_timestamp = max(last_timestamp + 1, int(captured_at * 1000))
-                detector.detect_async(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
-                                      last_timestamp)
 
             now = monotonic()
-            for _ in range(len(results)):
-                captured_at, result = results.popleft()
-                tracking_frames += 1
-                if not demo and now - captured_at < 0.25:
-                    harp.update_hands(result, captured_at, viewport)
-            harp.expire_tracking(now)
-            harp.audition_drag(now)
+            with lock:
+                tracking_frames += shared["tracked"]
+                shared["tracked"] = 0
+                harp.expire_tracking(now)
+                harp.audition_drag(now)
             if now - measured_at >= 1:
                 elapsed = now - measured_at
                 rates = (f"Cam {camera_frames / elapsed:.0f}  Track {tracking_frames / elapsed:.0f}  "
@@ -772,24 +812,26 @@ def run(harp, camera_index, demo, fullscreen=True):
                 else:
                     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
                 fullscreen = not fullscreen
-            if key in (ord("c"), ord("C")):
-                if harp.drag is not None:
-                    harp.finish_drag(now, commit=False)
-                harp.strings.clear()
-            if key in (ord("z"), ord("Z")) and harp.strings:
-                if harp.drag is not None:
-                    harp.finish_drag(now, commit=False)
-                harp.strings.pop()
-            if key in (ord("p"), ord("P")) and harp.drag is None:
-                harp.load_pirate_notes()
+            with lock:
+                if key in (ord("c"), ord("C")):
+                    if harp.drag is not None:
+                        harp.finish_drag(now, commit=False)
+                    harp.strings.clear()
+                if key in (ord("z"), ord("Z")) and harp.strings:
+                    if harp.drag is not None:
+                        harp.finish_drag(now, commit=False)
+                    harp.strings.pop()
+                if key in (ord("p"), ord("P")) and harp.drag is None:
+                    harp.load_pirate_notes()
             remaining = VIEW_FRAME_INTERVAL - (monotonic() - frame_started)
             if remaining > 0:
                 sleep(remaining)
     finally:
-        if detector is not None:
-            detector.close()
+        # Stop the camera thread first: it is the one feeding the detector.
         if feed is not None:
             feed.close()
+        if detector is not None:
+            detector.close()
         cv2.destroyAllWindows()
 
 
