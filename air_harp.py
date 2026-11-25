@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import cycle
 from math import exp, hypot, sin, tau
 from pathlib import Path
@@ -12,6 +13,7 @@ from time import monotonic, sleep
 import cv2
 import numpy as np
 import sounddevice as sd
+from PIL import Image, ImageDraw, ImageFont
 
 
 WIDTH, HEIGHT = 1920, 1080
@@ -22,6 +24,12 @@ PITCH_LENGTH_SPAN = WIDTH * 650 / 960
 GRAB_RADIUS = WIDTH / 48
 WINDOW = "Air Harp"
 MODEL = Path(__file__).with_name("hand_landmarker.task")
+FONT_PATHS = (
+    "/System/Library/Fonts/Helvetica.ttc",
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
 PALETTE = [(205, 175, 83), (154, 107, 210), (81, 188, 207), (126, 181, 93)]
 HAND_LINKS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -573,8 +581,44 @@ def draw_hand(frame, hand):
         cv2.circle(frame, points[8], 8, (226, 240, 246), 1, cv2.LINE_AA)
 
 
+@lru_cache(maxsize=None)
+def font(px):
+    """A TrueType face with Polish glyphs; OpenCV's Hershey fonts are ASCII-only."""
+    for path in FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, px)
+        except OSError:
+            pass
+    return ImageFont.load_default(px)
+
+
+@lru_cache(maxsize=512)
+def label(words, size):
+    """Cached alpha mask of the text and its offset from the left baseline point."""
+    face = font(round(size * 32))
+    left, top, right, bottom = face.getbbox(words, anchor="ls")
+    image = Image.new("L", (max(1, right - left), max(1, bottom - top)))
+    ImageDraw.Draw(image).text((-left, -top), words, fill=255, font=face, anchor="ls")
+    return np.asarray(image, dtype=np.float32)[..., None] / 255, (left, top)
+
+
+def text_size(words, size):
+    """Width and height above the baseline, like cv2.getTextSize."""
+    mask, (_, top) = label(words, size)
+    return mask.shape[1], -top
+
+
 def write(frame, words, origin, size=0.52, color=(226, 233, 245)):
-    cv2.putText(frame, words, origin, cv2.FONT_HERSHEY_SIMPLEX, size, color, 1, cv2.LINE_AA)
+    mask, (left, top) = label(words, size)
+    x, y = round(origin[0]) + left, round(origin[1]) + top
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + width, frame.shape[1]), min(y + height, frame.shape[0])
+    if x0 >= x1 or y0 >= y1:
+        return
+    alpha = mask[y0 - y:y1 - y, x0 - x:x1 - x]
+    region = frame[y0:y1, x0:x1]
+    region[:] = region * (1 - alpha) + np.array(color, np.float32) * alpha
 
 
 def render(frame, harp, now, demo, rates=""):
@@ -604,29 +648,34 @@ def render(frame, harp, now, demo, rates=""):
     top, bottom = frame[:88], frame[-60:]
     cv2.convertScaleAbs(top, dst=top, alpha=0.42)
     cv2.convertScaleAbs(bottom, dst=bottom, alpha=0.42)
-    write(frame, "AIR HARP", (36, 54), 1.2, (255, 233, 168))
-    guide = ("Drag to draw  /  Sweep to pluck  /  Drag either end to retune" if demo else
-             "Pinch both hands to draw  /  Sweep to pluck  /  Pinch or drag an end to retune")
-    show_phrase = any(string.phrase_step is not None for string in harp.strings)
-    write(frame, guide, (260, 38 if show_phrase else 53), 0.76)
+    title = "HARFA POWIETRZNA"
+    write(frame, title, (36, 54), 1.1, (255, 233, 168))
+    guide_x = 36 + text_size(title, 1.1)[0] + 48
+    guide = ("Przeciągnij: nowa struna  /  Przesuń przez strunę: dźwięk  /  "
+             "Przeciągnij koniec: strojenie" if demo else
+             "Zaciśnij palce obu dłoni i rozsuń: nowa struna  /  "
+             "Przesuń palec: dźwięk  /  Chwyć koniec: strojenie")
+    show_phrase = any(string.phrase_step is not None for string in strings)
+    write(frame, guide, (guide_x, 38 if show_phrase else 53), 0.66)
     if show_phrase:
-        write(frame, "He's a Pirate   /   Sweep down the middle and stop in any gap",
-              (260, 70), 0.68, (255, 233, 168))
-    tracking = "Mouse mode" if demo else f"Hands {len(hands)}/2"
+        write(frame, "He's a Pirate  /  Przesuwaj palec w dół środkiem, "
+              "zatrzymuj się w przerwach", (guide_x, 70), 0.62, (255, 233, 168))
+    tracking = "Tryb myszy" if demo else f"Dłonie: {len(hands)}/2"
     if not demo and not hands:
-        tracking += "  /  Show your palm and wrist"
+        tracking += "  /  Pokaż dłoń z nadgarstkiem"
     write_right(frame, tracking, 37 if rates else 53)
     if rates:
         write_right(frame, rates, 69)
-    write(frame, "P  Pirate strings     F  Fullscreen     Z  Undo     C  Clear     Esc  Quit",
-          (36, HEIGHT - 22), 0.73)
-    sound = "" if harp.audio.stream is not None else "  /  Audio unavailable"
-    write_right(frame, f"E2-E6 chromatic  /  {len(strings)} strings{sound}", HEIGHT - 22)
+    write(frame, "P  Struny Pirates     F  Pełny ekran     Z  Cofnij     C  Wyczyść     "
+          "Esc  Wyjście", (36, HEIGHT - 22), 0.66)
+    sound = "" if harp.audio.stream is not None else "  /  Brak dźwięku"
+    write_right(frame, f"Skala chromatyczna E2–E6  /  Struny: {len(strings)}{sound}",
+                HEIGHT - 22)
 
 
 def draw_note(frame, anchor, note, *, beside_endpoint=False):
     name = note_name(note)
-    width, height = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 1)[0]
+    width, height = text_size(name, 0.60)
     x = anchor[0] - width - 17 if beside_endpoint else anchor[0] - width / 2
     y = anchor[1] + height / 2 if beside_endpoint else anchor[1] - 14
     x = round(min(WIDTH - width - 8, max(8, x)))
@@ -637,8 +686,8 @@ def draw_note(frame, anchor, note, *, beside_endpoint=False):
 
 
 def write_right(frame, words, y):
-    width, _ = cv2.getTextSize(words, cv2.FONT_HERSHEY_SIMPLEX, 0.73, 1)[0]
-    write(frame, words, (WIDTH - width - 36, y), 0.73)
+    width, _ = text_size(words, 0.66)
+    write(frame, words, (WIDTH - width - 36, y), 0.66)
 
 
 def fit_camera_view(width, height):
@@ -809,8 +858,9 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
                 harp.audition_drag(now)
             if now - measured_at >= 1:
                 elapsed = now - measured_at
-                rates = (f"Cam {camera_frames / elapsed:.0f}  Track {tracking_frames / elapsed:.0f}  "
-                         f"View {view_frames / elapsed:.0f} fps") if not demo else ""
+                rates = (f"Kamera {camera_frames / elapsed:.0f}  "
+                         f"Śledzenie {tracking_frames / elapsed:.0f}  "
+                         f"Obraz {view_frames / elapsed:.0f} kl./s") if not demo else ""
                 if log and rates:
                     log.write(f"# {now:.4f} {rates}\n")
                 measured_at = now

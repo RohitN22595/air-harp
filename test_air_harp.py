@@ -56,4 +56,8 @@ def two_hands(y, pinch):
 assert not sweep([(0.0, two_hands(0.40, True)), (0.033, two_hands(0.47, True)),
                   (0.066, two_hands(0.60, True))]), "drawing gesture plucked"
 
+# The overlay is Polish: every diacritic must render ink, not an empty fallback glyph.
+for letter in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ–":
+    assert ah.label(letter, 0.66)[0].max() > 0.5, f"glyph missing: {letter}"
+
 print("ok")
