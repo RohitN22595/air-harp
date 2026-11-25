@@ -65,17 +65,61 @@ def note_name(note):
     return f"{NOTE_NAMES[note % 12]}{note // 12 - 1}"
 
 
+TONE_SECONDS = 1.1
+DECAY = 4.3  # Shared amplitude decay (1/s): every timbre fades over the same time.
+
+
 def make_tone(note, rate):
     """A soft attack followed by harmonics that decay at different rates."""
-    time = np.arange(int(rate * 1.1), dtype=np.float32) / rate
+    time = np.arange(int(rate * TONE_SECONDS), dtype=np.float32) / rate
     phase = tau * (440 * 2 ** ((note - 69) / 12)) * time
     tone = (
-        np.sin(phase) * np.exp(-4.3 * time)
+        np.sin(phase) * np.exp(-DECAY * time)
         + 0.36 * np.sin(2 * phase) * np.exp(-8 * time)
         + 0.18 * np.sin(3 * phase) * np.exp(-12 * time)
     )
-    tone *= np.minimum(time * 300, 1) * np.minimum((1.1 - time) * 25, 1)
+    tone *= np.minimum(time * 300, 1) * np.minimum((TONE_SECONDS - time) * 25, 1)
     return np.asarray(tone * 0.23, dtype=np.float32)
+
+
+def pluck_amplitudes(count, position, power):
+    """Harmonic levels of a string plucked at `position` (0-1 along its length)."""
+    n = np.arange(1, count + 1)
+    return np.abs(np.sin(np.pi * n * position)) / n ** power
+
+
+# name, harmonic levels, how fast upper harmonics die (1/s per harmonic step),
+# attack (s), detune of a second oscillator (0 = none), loudness trim
+TIMBRES = (
+    ("Podstawowe", None, 0, 0, 0, 1),
+    ("Harfa", 1 / np.arange(1, 9) ** 2, 2.5, 0.004, 0, 1),
+    ("Gitara", pluck_amplitudes(14, 0.18, 1.5), 3.5, 0.002, 0, 1),
+    ("Banjo", pluck_amplitudes(20, 0.08, 1.0), 7.0, 0.001, 0, 1),
+    ("Saw Synth", 1 / np.arange(1, 33), 1.6, 0.006, 0.004, 0.75),
+)
+
+
+def make_timbre_tone(note, rate, timbre):
+    """Additive tone sharing the length and decay of make_tone, so only colour differs."""
+    _, levels, damping, attack, detune, trim = TIMBRES[timbre]
+    base = make_tone(note, rate)
+    if levels is None:
+        return base
+    time = np.arange(len(base), dtype=np.float32) / rate
+    freq = 440 * 2 ** ((note - 69) / 12)
+    fade = np.exp(-damping * time)  # multiplied in once per harmonic step
+    tone = np.zeros_like(time)
+    for spread in ((1 - detune, 1 + detune) if detune else (1,)):
+        damp = np.ones_like(time)
+        for n, level in enumerate(levels, 1):
+            if n * freq * spread >= rate * 0.45:
+                break
+            tone += level * np.sin(tau * n * freq * spread * time) * damp
+            damp *= fade
+    tone *= (np.minimum(time / attack, 1) * np.exp(-DECAY * time)
+             * np.minimum((TONE_SECONDS - time) * 25, 1))
+    tone *= trim * np.abs(base).max() / np.abs(tone).max()  # same peak as timbre 1
+    return tone.astype(np.float32)
 
 
 class Audio:
@@ -83,9 +127,11 @@ class Audio:
         self.pending = deque(maxlen=48)
         self.voices = []
         self.stream = None
+        self.timbre = 0  # Index into TIMBRES; keys 1-5 switch it.
         try:
             rate = int(sd.query_devices(kind="output")["default_samplerate"])
-            self.tones = {note: make_tone(note, rate) for note in GUITAR_NOTES}
+            self.tones = [{note: make_timbre_tone(note, rate, timbre) for note in GUITAR_NOTES}
+                          for timbre in range(len(TIMBRES))]
             for latency in (0.020, "low"):
                 try:
                     self.stream = sd.OutputStream(
@@ -103,7 +149,7 @@ class Audio:
 
     def play(self, note):
         if self.stream is not None:
-            self.pending.append(self.tones[note])
+            self.pending.append(self.tones[self.timbre][note])
 
     def mix(self, output, frames, _time, _status):
         output.fill(0)
@@ -667,11 +713,12 @@ def render(frame, harp, now, demo, rates=""):
     write_right(frame, tracking, 37 if rates else 53)
     if rates:
         write_right(frame, rates, 69)
-    write(frame, "P  Struny Pirates     F  Pełny ekran     Z  Cofnij     C  Wyczyść     "
-          "Esc  Wyjście", (36, HEIGHT - 22), 0.66)
-    sound = "" if harp.audio.stream is not None else "  /  Brak dźwięku"
-    write_right(frame, f"Skala chromatyczna E2–E6  /  Struny: {len(strings)}{sound}",
-                HEIGHT - 22)
+    write(frame, "1–5  Brzmienie     P  Struny Pirates     F  Pełny ekran     Z  Cofnij     "
+          "C  Wyczyść     Esc  Wyjście", (36, HEIGHT - 22), 0.66)
+    timbre = getattr(harp.audio, "timbre", 0)
+    sound = (f"{timbre + 1}  {TIMBRES[timbre][0]}" if harp.audio.stream is not None
+             else "Brak dźwięku")
+    write_right(frame, f"{sound}  /  E2–E6  /  Struny: {len(strings)}", HEIGHT - 22)
 
 
 def draw_note(frame, anchor, note, *, beside_endpoint=False):
@@ -914,6 +961,8 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
                     harp.strings.pop()
                 if key in (ord("p"), ord("P")) and harp.drag is None:
                     harp.load_pirate_notes()
+                if ord("1") <= key < ord("1") + len(TIMBRES):
+                    harp.audio.timbre = key - ord("1")
             remaining = VIEW_FRAME_INTERVAL - (monotonic() - frame_started)
             if remaining > 0:
                 sleep(remaining)

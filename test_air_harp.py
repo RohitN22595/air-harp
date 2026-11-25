@@ -60,6 +60,20 @@ assert not sweep([(0.0, two_hands(0.40, True)), (0.033, two_hands(0.47, True)),
 for letter in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ–":
     assert ah.label(letter, 0.66)[0].max() > 0.5, f"glyph missing: {letter}"
 
+# Timbres: same length and loudness peak (trim aside), different colour, same fade-out.
+import numpy as np  # noqa: E402
+
+tones = [ah.make_timbre_tone(57, 48000, i) for i in range(len(ah.TIMBRES))]
+assert len({len(t) for t in tones}) == 1, "timbres differ in length"
+for i, tone in enumerate(tones):
+    trim = ah.TIMBRES[i][5]
+    assert abs(np.abs(tone).max() - trim * np.abs(tones[0]).max()) < 1e-3, f"peak {i}"
+    # Shared decay: energy in 0.5-0.6 s vs 0.1-0.2 s stays near exp(-DECAY * 0.4) for all.
+    early, late = (np.sqrt(np.mean(tone[a:a + 4800] ** 2)) for a in (4800, 24000))
+    assert 0.1 < late / early < 0.3, f"timbre {i} decays differently: {late / early:.2f}"
+assert len({round(float(np.abs(np.fft.rfft(t)[2000:]).sum()), 1) for t in tones}) == 5, \
+    "two timbres sound identical"
+
 # Camera fallback: preferred index missing -> next working one; failed ones are skipped.
 real_open = ah.open_camera
 ah.open_camera = lambda index, fast_mode=True: f"cam{index}" if index in (0, 3) else None
