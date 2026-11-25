@@ -3,10 +3,14 @@
 import argparse
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from itertools import cycle
 from math import exp, hypot, sin, tau
 from pathlib import Path
+from queue import Empty, Full, Queue
+from subprocess import CalledProcessError, run as run_process
+from tempfile import mkdtemp
 from threading import Event, Lock, Thread
 from wave import open as open_wav
 from time import monotonic, sleep
@@ -162,8 +166,10 @@ class Audio:
         self.voices = []
         self.stream = None
         self.timbre = 0  # Index into TIMBRES; keys 1-5 switch it.
+        self.tap = None  # A recorder's deque; mix() appends (time, block) while recording.
+        self.rate = 48000
         try:
-            rate = int(sd.query_devices(kind="output")["default_samplerate"])
+            rate = self.rate = int(sd.query_devices(kind="output")["default_samplerate"])
             self.tones = [{note: make_timbre_tone(note, rate, timbre) for note in GUITAR_NOTES}
                           for timbre in range(len(TIMBRES))]
             for latency in (0.020, "low"):
@@ -197,11 +203,145 @@ class Audio:
                 remaining.append((wave, offset + frames))
         self.voices = remaining
         np.clip(output, -0.9, 0.9, out=output)
+        tap = self.tap
+        if tap is not None:
+            tap.append((monotonic(), output[:, 0].copy()))
 
     def close(self):
         if self.stream is not None:
             self.stream.close()
             self.stream = None
+
+
+class Recorder:
+    """R toggles recording: the rendered view, the app's audio and the microphone.
+
+    Frames and audio blocks are written by one worker thread; on stop ffmpeg muxes
+    them into a single MP4 in `folder`, with each audio track offset to the video start.
+    """
+
+    FPS = 30
+    SIZE = (1280, 720)
+
+    def __init__(self, folder, audio, use_mic=True):
+        self.folder = Path(folder).expanduser()
+        self.audio = audio
+        self.use_mic = use_mic
+        self.active = False
+        self.worker = None
+        self.message, self.message_until = "", 0.0
+
+    def toggle(self, now):
+        self.stop() if self.active else self.start(now)
+
+    def start(self, now):
+        if self.worker is not None and self.worker.is_alive():
+            self.say("Poprzednie nagranie jeszcze się zapisuje", now)
+            return
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.output = self.folder / f"air-harp-{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
+        self.parts = Path(mkdtemp(prefix="air-harp-"))
+        self.frames = Queue(maxsize=self.FPS * 2)
+        self.app_blocks, self.mic_blocks = deque(), deque()
+        self.queued = self.dropped = 0
+        self.started = now
+        self.mic, self.mic_rate = None, None
+        if self.use_mic:
+            try:
+                self.mic = sd.InputStream(
+                    channels=1, dtype="float32",
+                    callback=lambda data, *_: self.mic_blocks.append((monotonic(), data[:, 0].copy())))
+                self.mic_rate = int(self.mic.samplerate)
+                self.mic.start()
+            except sd.PortAudioError as error:
+                print(f"Mikrofon niedostępny, nagrywam bez niego: {error}", flush=True)
+                self.mic = None
+        self.audio.tap = self.app_blocks
+        self.active = True
+        self.worker = Thread(target=self.write, name="air-harp-recorder", daemon=True)
+        self.worker.start()
+
+    def add_frame(self, frame, now):
+        """Queue the view so the video keeps a steady FPS timeline (repeat or skip frames)."""
+        if not self.active:
+            return
+        due = int((now - self.started) * self.FPS) + 1
+        if self.queued < due:
+            frame = frame.copy()  # The caller draws the REC badge onto its frame next.
+        while self.queued < due:
+            self.queued += 1
+            try:
+                self.frames.put_nowait(frame)
+            except Full:
+                self.dropped += 1  # Encoder fell behind: video stays in sync, just choppier.
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        self.audio.tap = None
+        if self.mic is not None:
+            self.mic.stop()
+            self.mic.close()
+        self.frames.put(None)
+        self.say("Zapisywanie nagrania…", monotonic(), seconds=60)
+
+    def say(self, text, now, seconds=5):
+        self.message, self.message_until = text, now + seconds
+
+    def write(self):
+        video = cv2.VideoWriter(str(self.parts / "video.mp4"),
+                                cv2.VideoWriter_fourcc(*"mp4v"), self.FPS, self.SIZE)
+        tracks = {"app": (self.app_blocks, self.audio.rate), "mic": (self.mic_blocks, self.mic_rate)}
+        wavs, first = {}, {}
+        frames = 0
+        while True:
+            try:
+                frame = self.frames.get(timeout=0.05)
+            except Empty:
+                frame = False
+            if frame is not None and frame is not False:
+                video.write(cv2.resize(frame, self.SIZE, interpolation=cv2.INTER_AREA))
+                frames += 1
+            for name, (blocks, rate) in tracks.items():
+                while blocks:
+                    at, block = blocks.popleft()
+                    if name not in wavs:
+                        first[name] = at - len(block) / rate  # time of the block's first sample
+                        wavs[name] = open_wav(str(self.parts / f"{name}.wav"), "wb")
+                        wavs[name].setnchannels(1)
+                        wavs[name].setsampwidth(2)
+                        wavs[name].setframerate(rate)
+                    wavs[name].writeframes((np.clip(block, -1, 1) * 32767).astype("<i2").tobytes())
+            if frame is None:
+                break
+        video.release()
+        for wav in wavs.values():
+            wav.close()
+        self.mux(frames, first)
+
+    def mux(self, frames, first):
+        command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.parts / "video.mp4")]
+        for name, start in first.items():
+            command += ["-itsoffset", f"{max(0.0, start - self.started):.3f}",
+                        "-i", str(self.parts / f"{name}.wav")]
+        inputs = "".join(f"[{index}:a]" for index in range(1, len(first) + 1))
+        if first:
+            command += ["-filter_complex",
+                        f"{inputs}amix=inputs={len(first)}:duration=longest:normalize=0[a]",
+                        "-map", "0:v", "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+        command += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-t", f"{frames / self.FPS:.3f}", str(self.output)]
+        try:
+            run_process(command, check=True, capture_output=True, text=True)
+            self.say(f"Zapisano: {self.output.name}", monotonic(), seconds=6)
+            print(f"Nagranie zapisane: {self.output}", flush=True)
+            if self.dropped:
+                print(f"Pominięte klatki (koder nie nadążał): {self.dropped}", flush=True)
+        except (OSError, CalledProcessError) as error:
+            detail = getattr(error, "stderr", "") or error
+            self.say("Błąd zapisu nagrania (szczegóły w terminalu)", monotonic(), seconds=8)
+            print(f"ffmpeg nie złożył nagrania ({detail}). Części: {self.parts}", flush=True)
 
 
 class CameraFeed:
@@ -747,8 +887,8 @@ def render(frame, harp, now, demo, rates=""):
     write_right(frame, tracking, 37 if rates else 53)
     if rates:
         write_right(frame, rates, 69)
-    write(frame, "1–5  Brzmienie     P  Struny Pirates     F  Pełny ekran     Z  Cofnij     "
-          "C  Wyczyść     Esc  Wyjście", (36, HEIGHT - 22), 0.66)
+    write(frame, "1–5  Brzmienie    R  Nagrywanie    P  Pirates    F  Pełny ekran    "
+          "Z  Cofnij    C  Wyczyść    Esc  Wyjście", (36, HEIGHT - 22), 0.66)
     timbre = getattr(harp.audio, "timbre", 0)
     sound = (f"{timbre + 1}  {TIMBRES[timbre][0]}" if harp.audio.stream is not None
              else "Brak dźwięku")
@@ -857,7 +997,20 @@ def open_camera(index, fast_mode=True):
     return CameraFeed(camera)
 
 
-def run(harp, camera_index, demo, fullscreen=True, log_path=None):
+def draw_recording(frame, recorder, now):
+    """Drawn after the frame is captured, so the badge never ends up in the video."""
+    x, y = WIDTH // 2 + 40, HEIGHT - 22
+    if recorder.active:
+        elapsed = int(now - recorder.started)
+        if int(now * 2) % 2 == 0:
+            cv2.circle(frame, (x, y - 8), 9, (40, 40, 230), -1, cv2.LINE_AA)
+        write(frame, f"NAGRYWANIE  {elapsed // 60:02d}:{elapsed % 60:02d}", (x + 20, y), 0.66,
+              (120, 120, 255))
+    elif now < recorder.message_until:
+        write(frame, recorder.message, (x, y), 0.66, (255, 233, 168))
+
+
+def run(harp, camera_index, demo, fullscreen=True, log_path=None, recorder=None):
     feed = None
     detector = None
     try:
@@ -969,11 +1122,16 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
                 camera_frames = tracking_frames = view_frames = 0
             frame = background.copy()
             render(frame, harp, now, demo, rates)
+            if recorder is not None:
+                recorder.add_frame(frame, now)
+                draw_recording(frame, recorder, now)
             cv2.imshow(WINDOW, frame)
             view_frames += 1
             key = cv2.pollKey() & 0xFF
             if key in (27, ord("q"), ord("Q")) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                 break
+            if key in (ord("r"), ord("R")) and recorder is not None:
+                recorder.toggle(monotonic())
             if key in (ord("f"), ord("F")):
                 if fullscreen:
                     x, y, width, height = cv2.getWindowImageRect(WINDOW)
@@ -1001,6 +1159,11 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
             if remaining > 0:
                 sleep(remaining)
     finally:
+        if recorder is not None:
+            recorder.stop()  # Quitting mid-take still saves it.
+            if recorder.worker is not None:
+                print("Zapisuję nagranie…", flush=True)
+                recorder.worker.join()
         # Stop the camera thread first: it is the one feeding the detector.
         if feed is not None:
             feed.close()
@@ -1018,12 +1181,18 @@ def main():
     parser.add_argument("--fullscreen", action="store_true",
                         help="Start fullscreen (default: resizable window)")
     parser.add_argument("--log", help="Write one CSV row per tracking result to this file")
+    parser.add_argument("--record-dir", default="~/Movies/Air Harp",
+                        help="Where R saves recordings (default: ~/Movies/Air Harp)")
+    parser.add_argument("--no-mic", action="store_true",
+                        help="Record only the app's sound, without the microphone")
     args = parser.parse_args()
     audio = Audio()
     try:
         harp = Harp(audio)
         harp.load_pirate_notes()
-        run(harp, args.camera, args.demo, fullscreen=args.fullscreen, log_path=args.log)
+        recorder = Recorder(args.record_dir, audio, use_mic=not args.no_mic)
+        run(harp, args.camera, args.demo, fullscreen=args.fullscreen, log_path=args.log,
+            recorder=recorder)
     except (RuntimeError, cv2.error) as error:
         parser.exit(1, f"Air Harp: {error}\n")
     except KeyboardInterrupt:

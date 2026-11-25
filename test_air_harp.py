@@ -88,6 +88,37 @@ assert len(ah.make_timbre_tone(57, 48000, steel)) > 2 * len(tones[0]), "steel de
 assert len({round(float(np.abs(np.fft.rfft(t)[2000:]).sum()), 1) for t in tones}) == 5, \
     "two timbres sound identical"
 
+# Recorder: 2 s of frames plus app audio become one MP4 with H.264 video and AAC audio.
+import json  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+from time import monotonic, sleep  # noqa: E402
+
+fake_audio = SimpleNamespace(rate=48000, tap=None)
+folder = Path(tempfile.mkdtemp(prefix="air-harp-test-"))
+recorder = ah.Recorder(folder, fake_audio, use_mic=False)
+start = monotonic()
+recorder.start(start)
+assert fake_audio.tap is not None, "app audio not tapped"
+for i in range(60):  # 2 s at 30 fps, a moving white bar
+    image = np.zeros((ah.HEIGHT, ah.WIDTH, 3), np.uint8)
+    image[:, i * 30:i * 30 + 30] = 255
+    recorder.add_frame(image, start + i / 30)
+    image[:] = 0  # mutate after queuing, like the REC badge does
+    fake_audio.tap.append((monotonic(), np.full(480, 0.2, np.float32)))
+    sleep(0.005)
+recorder.stop()
+recorder.worker.join(timeout=30)
+assert fake_audio.tap is None, "app audio still tapped after stop"
+probe = json.loads(subprocess.run(
+    ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json",
+     str(recorder.output)], capture_output=True, text=True, check=True).stdout)
+codecs = {s["codec_type"]: s["codec_name"] for s in probe["streams"]}
+assert codecs == {"video": "h264", "audio": "aac"}, codecs
+assert 1.8 < float(probe["format"]["duration"]) < 2.3, probe["format"]["duration"]
+assert recorder.dropped == 0, f"dropped {recorder.dropped} frames"
+
 # Camera fallback: preferred index missing -> next working one; failed ones are skipped.
 real_open = ah.open_camera
 ah.open_camera = lambda index, fast_mode=True: f"cam{index}" if index in (0, 3) else None
