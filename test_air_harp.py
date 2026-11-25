@@ -60,4 +60,13 @@ assert not sweep([(0.0, two_hands(0.40, True)), (0.033, two_hands(0.47, True)),
 for letter in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ–":
     assert ah.label(letter, 0.66)[0].max() > 0.5, f"glyph missing: {letter}"
 
+# Camera fallback: preferred index missing -> next working one; failed ones are skipped.
+real_open = ah.open_camera
+ah.open_camera = lambda index, fast_mode=True: f"cam{index}" if index in (0, 3) else None
+assert ah.open_any_camera(1) == ("cam0", 0), "no fallback from a missing camera"
+assert ah.open_any_camera(1, skip={0}) == ("cam3", 3), "failed camera reused"
+assert ah.open_any_camera(3) == ("cam3", 3), "preferred camera skipped"
+assert ah.open_any_camera(1, skip={0, 3}) == (None, 1), "phantom camera"
+ah.open_camera = real_open
+
 print("ok")

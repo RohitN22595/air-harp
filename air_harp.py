@@ -24,6 +24,7 @@ PITCH_LENGTH_SPAN = WIDTH * 650 / 960
 GRAB_RADIUS = WIDTH / 48
 WINDOW = "Air Harp"
 MODEL = Path(__file__).with_name("hand_landmarker.task")
+CAMERA_SCAN = range(5)  # Indices tried, in order, after the preferred camera.
 FONT_PATHS = (
     "/System/Library/Fonts/Helvetica.ttc",
     "C:/Windows/Fonts/segoeui.ttf",
@@ -749,6 +750,18 @@ def frame_tracker(detector, mp, shared):
     return track
 
 
+def open_any_camera(preferred, skip=()):
+    """Open the preferred camera, else the first other index that works."""
+    for index in dict.fromkeys((preferred, *CAMERA_SCAN)):
+        if index not in skip:
+            feed = open_camera(index)
+            if feed is not None:
+                if index != preferred:
+                    print(f"Kamera {preferred} niedostępna, używam kamery {index}.", flush=True)
+                return feed, index
+    return None, preferred
+
+
 def open_camera(index, fast_mode=True):
     camera = cv2.VideoCapture(index)
     if not camera.isOpened():
@@ -772,11 +785,12 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
         cv2.imshow(WINDOW, np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8))
         cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN,
                               cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        failed_cameras = set()
         if not demo:
-            feed = open_camera(camera_index)
+            feed, camera_index = open_any_camera(camera_index)
             if feed is None:
                 demo = True
-                print(f"Webcam {camera_index} unavailable. Starting mouse mode.")
+                print("Brak dostępnej kamery. Uruchamiam tryb myszy.")
         # Plucks fire on MediaPipe's thread the moment a result lands; the lock keeps
         # them from interleaving with keyboard, mouse and timeout updates.
         lock = Lock()
@@ -826,10 +840,17 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
                 feed.close()
                 feed = open_camera(camera_index, fast_mode=False) if retry_default else None
                 tried_default_camera_mode = True
+                if feed is None:
+                    # The camera vanished (e.g. the iPhone disconnected): try the others.
+                    failed_cameras.add(camera_index)
+                    feed, camera_index = open_any_camera(camera_index, failed_cameras)
+                    tried_default_camera_mode = False
+                    with lock:
+                        harp.reset_tracking(monotonic())
                 if feed is not None:
                     feed.on_frame = frame_tracker(detector, mp, shared)
                 else:
-                    print(f"Webcam {camera_index} stopped supplying frames. Starting mouse mode.")
+                    print("Żadna kamera nie dostarcza obrazu. Uruchamiam tryb myszy.")
                     detector.close()
                     detector = None
                     with lock:
@@ -907,7 +928,9 @@ def run(harp, camera_index, demo, fullscreen=True, log_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--camera", default=0, type=int, help="Webcam index (default: 0)")
+    parser.add_argument("--camera", default=1, type=int,
+                        help="Preferred camera index; falls back to the next working one "
+                             "(default: 1, the iPhone on this Mac)")
     parser.add_argument("--demo", action="store_true", help="Play with the mouse without a webcam")
     parser.add_argument("--fullscreen", action="store_true",
                         help="Start fullscreen (default: resizable window)")
