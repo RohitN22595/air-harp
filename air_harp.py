@@ -8,6 +8,7 @@ from itertools import cycle
 from math import exp, hypot, sin, tau
 from pathlib import Path
 from threading import Event, Lock, Thread
+from wave import open as open_wav
 from time import monotonic, sleep
 
 import cv2
@@ -24,6 +25,7 @@ PITCH_LENGTH_SPAN = WIDTH * 650 / 960
 GRAB_RADIUS = WIDTH / 48
 WINDOW = "Air Harp"
 MODEL = Path(__file__).with_name("hand_landmarker.task")
+SAMPLES = Path(__file__).with_name("samples")
 CAMERA_SCAN = range(5)  # Indices tried, in order, after the preferred camera.
 FONT_PATHS = (
     "/System/Library/Fonts/Helvetica.ttc",
@@ -82,6 +84,35 @@ def make_tone(note, rate):
     return np.asarray(tone * 0.23, dtype=np.float32)
 
 
+SAMPLE_SECONDS = 3.0  # Recorded timbres ring out naturally, up to this long.
+
+
+@lru_cache(maxsize=None)
+def load_samples(folder):
+    """{MIDI note: (waveform, rate)} from samples/<folder>/*_<note>_*.wav (16-bit mono)."""
+    found = {}
+    for path in (SAMPLES / folder).glob("*.wav"):
+        with open_wav(str(path)) as source:
+            data = np.frombuffer(source.readframes(source.getnframes()), "<i2")
+            found[int(path.stem.split("_")[1])] = (data.astype(np.float32) / 32768,
+                                                   source.getframerate())
+    if not found:
+        raise RuntimeError(f"Missing samples in {SAMPLES / folder}")
+    return found
+
+
+def make_sampled_tone(note, rate, folder):
+    """Nearest recorded note, resampled to pitch, cut at SAMPLE_SECONDS with a short fade."""
+    samples = load_samples(folder)
+    root = min(samples, key=lambda key: abs(key - note))
+    data, source_rate = samples[root]
+    step = 2 ** ((note - root) / 12) * source_rate / rate  # source samples per output one
+    length = min(int((len(data) - 1) / step), int(rate * SAMPLE_SECONDS))
+    tone = np.interp(np.arange(length) * step, np.arange(len(data)), data)
+    tone *= np.minimum((length - np.arange(length)) / (rate * 0.05), 1)
+    return tone
+
+
 def pluck_amplitudes(count, position, power):
     """Harmonic levels of a string plucked at `position` (0-1 along its length)."""
     n = np.arange(1, count + 1)
@@ -93,7 +124,7 @@ def pluck_amplitudes(count, position, power):
 TIMBRES = (
     ("Podstawowe", None, 0, 0, 0, 1),
     ("Harfa", 1 / np.arange(1, 9) ** 2, 2.5, 0.004, 0, 1),
-    ("Gitara", pluck_amplitudes(14, 0.18, 1.5), 3.5, 0.002, 0, 1),
+    ("Steel Guitar", "steel-guitar", 0, 0, 0, 1),  # recorded samples, own longer decay
     ("Banjo", pluck_amplitudes(20, 0.08, 1.0), 7.0, 0.001, 0, 1),
     ("Saw Synth", 1 / np.arange(1, 33), 1.6, 0.006, 0.004, 0.75),
 )
@@ -105,6 +136,9 @@ def make_timbre_tone(note, rate, timbre):
     base = make_tone(note, rate)
     if levels is None:
         return base
+    if isinstance(levels, str):
+        tone = make_sampled_tone(note, rate, levels)
+        return (tone * trim * np.abs(base).max() / np.abs(tone).max()).astype(np.float32)
     time = np.arange(len(base), dtype=np.float32) / rate
     freq = 440 * 2 ** ((note - 69) / 12)
     fade = np.exp(-damping * time)  # multiplied in once per harmonic step

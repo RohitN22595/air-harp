@@ -60,17 +60,31 @@ assert not sweep([(0.0, two_hands(0.40, True)), (0.033, two_hands(0.47, True)),
 for letter in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ–":
     assert ah.label(letter, 0.66)[0].max() > 0.5, f"glyph missing: {letter}"
 
-# Timbres: same length and loudness peak (trim aside), different colour, same fade-out.
+# Timbres: same loudness peak (trim aside), different colour. Synthesised ones share
+# length and fade-out; the recorded steel guitar rings longer.
 import numpy as np  # noqa: E402
 
 tones = [ah.make_timbre_tone(57, 48000, i) for i in range(len(ah.TIMBRES))]
-assert len({len(t) for t in tones}) == 1, "timbres differ in length"
+synth = [t for i, t in enumerate(tones) if not isinstance(ah.TIMBRES[i][1], str)]
+assert len({len(t) for t in synth}) == 1, "synth timbres differ in length"
 for i, tone in enumerate(tones):
     trim = ah.TIMBRES[i][5]
     assert abs(np.abs(tone).max() - trim * np.abs(tones[0]).max()) < 1e-3, f"peak {i}"
+for i, tone in enumerate(synth):
     # Shared decay: energy in 0.5-0.6 s vs 0.1-0.2 s stays near exp(-DECAY * 0.4) for all.
     early, late = (np.sqrt(np.mean(tone[a:a + 4800] ** 2)) for a in (4800, 24000))
     assert 0.1 < late / early < 0.3, f"timbre {i} decays differently: {late / early:.2f}"
+
+# Steel guitar: real samples, longer than the synth tones, pitched to the asked note.
+steel = ah.TIMBRES.index(next(t for t in ah.TIMBRES if t[0] == "Steel Guitar"))
+for note in (40, 57, 64, 88):  # recorded root, shifted down, recorded root, top of range
+    tone = ah.make_timbre_tone(note, 48000, steel)
+    spectrum = np.abs(np.fft.rfft(tone[:24000] * np.hanning(24000)))
+    peak_hz = np.argmax(spectrum[40:]) + 40  # 2 Hz bins; skip DC rumble
+    fundamental = 440 * 2 ** ((note - 69) / 12)
+    harmonic = peak_hz * 2 / fundamental
+    assert abs(harmonic - round(harmonic)) < 0.05, f"note {note} off pitch: {peak_hz * 2} Hz"
+assert len(ah.make_timbre_tone(57, 48000, steel)) > 2 * len(tones[0]), "steel decay not longer"
 assert len({round(float(np.abs(np.fft.rfft(t)[2000:]).sum()), 1) for t in tones}) == 5, \
     "two timbres sound identical"
 
