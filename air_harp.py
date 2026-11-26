@@ -3,15 +3,22 @@
 import argparse
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
+from functools import lru_cache
 from itertools import cycle
 from math import exp, hypot, sin, tau
 from pathlib import Path
-from threading import Event, Thread
+from queue import Empty, Full, Queue
+from subprocess import CalledProcessError, run as run_process
+from tempfile import mkdtemp
+from threading import Event, Lock, Thread
+from wave import open as open_wav
 from time import monotonic, sleep
 
 import cv2
 import numpy as np
 import sounddevice as sd
+from PIL import Image, ImageDraw, ImageFont
 
 
 WIDTH, HEIGHT = 1920, 1080
@@ -22,6 +29,14 @@ PITCH_LENGTH_SPAN = WIDTH * 650 / 960
 GRAB_RADIUS = WIDTH / 48
 WINDOW = "Air Harp"
 MODEL = Path(__file__).with_name("hand_landmarker.task")
+SAMPLES = Path(__file__).with_name("samples")
+CAMERA_SCAN = range(5)  # Indices tried, in order, after the preferred camera.
+FONT_PATHS = (
+    "/System/Library/Fonts/Helvetica.ttc",
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
 PALETTE = [(205, 175, 83), (154, 107, 210), (81, 188, 207), (126, 181, 93)]
 HAND_LINKS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -56,17 +71,93 @@ def note_name(note):
     return f"{NOTE_NAMES[note % 12]}{note // 12 - 1}"
 
 
+TONE_SECONDS = 1.1
+DECAY = 4.3  # Shared amplitude decay (1/s): every timbre fades over the same time.
+
+
 def make_tone(note, rate):
     """A soft attack followed by harmonics that decay at different rates."""
-    time = np.arange(int(rate * 1.1), dtype=np.float32) / rate
+    time = np.arange(int(rate * TONE_SECONDS), dtype=np.float32) / rate
     phase = tau * (440 * 2 ** ((note - 69) / 12)) * time
     tone = (
-        np.sin(phase) * np.exp(-4.3 * time)
+        np.sin(phase) * np.exp(-DECAY * time)
         + 0.36 * np.sin(2 * phase) * np.exp(-8 * time)
         + 0.18 * np.sin(3 * phase) * np.exp(-12 * time)
     )
-    tone *= np.minimum(time * 300, 1) * np.minimum((1.1 - time) * 25, 1)
+    tone *= np.minimum(time * 300, 1) * np.minimum((TONE_SECONDS - time) * 25, 1)
     return np.asarray(tone * 0.23, dtype=np.float32)
+
+
+SAMPLE_SECONDS = 3.0  # Recorded timbres ring out naturally, up to this long.
+
+
+@lru_cache(maxsize=None)
+def load_samples(folder):
+    """{MIDI note: (waveform, rate)} from samples/<folder>/*_<note>_*.wav (16-bit mono)."""
+    found = {}
+    for path in (SAMPLES / folder).glob("*.wav"):
+        with open_wav(str(path)) as source:
+            data = np.frombuffer(source.readframes(source.getnframes()), "<i2")
+            found[int(path.stem.split("_")[1])] = (data.astype(np.float32) / 32768,
+                                                   source.getframerate())
+    if not found:
+        raise RuntimeError(f"Missing samples in {SAMPLES / folder}")
+    return found
+
+
+def make_sampled_tone(note, rate, folder):
+    """Nearest recorded note, resampled to pitch, cut at SAMPLE_SECONDS with a short fade."""
+    samples = load_samples(folder)
+    root = min(samples, key=lambda key: abs(key - note))
+    data, source_rate = samples[root]
+    step = 2 ** ((note - root) / 12) * source_rate / rate  # source samples per output one
+    length = min(int((len(data) - 1) / step), int(rate * SAMPLE_SECONDS))
+    tone = np.interp(np.arange(length) * step, np.arange(len(data)), data)
+    tone *= np.minimum((length - np.arange(length)) / (rate * 0.05), 1)
+    return tone
+
+
+def pluck_amplitudes(count, position, power):
+    """Harmonic levels of a string plucked at `position` (0-1 along its length)."""
+    n = np.arange(1, count + 1)
+    return np.abs(np.sin(np.pi * n * position)) / n ** power
+
+
+# name, harmonic levels, how fast upper harmonics die (1/s per harmonic step),
+# attack (s), detune of a second oscillator (0 = none), loudness trim
+TIMBRES = (
+    ("Podstawowe", None, 0, 0, 0, 1),
+    ("Harfa", 1 / np.arange(1, 9) ** 2, 2.5, 0.004, 0, 1),
+    ("Steel Guitar", "steel-guitar", 0, 0, 0, 1),  # recorded samples, own longer decay
+    ("Banjo", pluck_amplitudes(20, 0.08, 1.0), 7.0, 0.001, 0, 1),
+    ("Saw Synth", 1 / np.arange(1, 33), 1.6, 0.006, 0.004, 0.75),
+)
+
+
+def make_timbre_tone(note, rate, timbre):
+    """Additive tone sharing the length and decay of make_tone, so only colour differs."""
+    _, levels, damping, attack, detune, trim = TIMBRES[timbre]
+    base = make_tone(note, rate)
+    if levels is None:
+        return base
+    if isinstance(levels, str):
+        tone = make_sampled_tone(note, rate, levels)
+        return (tone * trim * np.abs(base).max() / np.abs(tone).max()).astype(np.float32)
+    time = np.arange(len(base), dtype=np.float32) / rate
+    freq = 440 * 2 ** ((note - 69) / 12)
+    fade = np.exp(-damping * time)  # multiplied in once per harmonic step
+    tone = np.zeros_like(time)
+    for spread in ((1 - detune, 1 + detune) if detune else (1,)):
+        damp = np.ones_like(time)
+        for n, level in enumerate(levels, 1):
+            if n * freq * spread >= rate * 0.45:
+                break
+            tone += level * np.sin(tau * n * freq * spread * time) * damp
+            damp *= fade
+    tone *= (np.minimum(time / attack, 1) * np.exp(-DECAY * time)
+             * np.minimum((TONE_SECONDS - time) * 25, 1))
+    tone *= trim * np.abs(base).max() / np.abs(tone).max()  # same peak as timbre 1
+    return tone.astype(np.float32)
 
 
 class Audio:
@@ -74,9 +165,13 @@ class Audio:
         self.pending = deque(maxlen=48)
         self.voices = []
         self.stream = None
+        self.timbre = 0  # Index into TIMBRES; keys 1-5 switch it.
+        self.tap = None  # A recorder's deque; mix() appends (time, block) while recording.
+        self.rate = 48000
         try:
-            rate = int(sd.query_devices(kind="output")["default_samplerate"])
-            self.tones = {note: make_tone(note, rate) for note in GUITAR_NOTES}
+            rate = self.rate = int(sd.query_devices(kind="output")["default_samplerate"])
+            self.tones = [{note: make_timbre_tone(note, rate, timbre) for note in GUITAR_NOTES}
+                          for timbre in range(len(TIMBRES))]
             for latency in (0.020, "low"):
                 try:
                     self.stream = sd.OutputStream(
@@ -94,7 +189,7 @@ class Audio:
 
     def play(self, note):
         if self.stream is not None:
-            self.pending.append(self.tones[note])
+            self.pending.append(self.tones[self.timbre][note])
 
     def mix(self, output, frames, _time, _status):
         output.fill(0)
@@ -108,6 +203,9 @@ class Audio:
                 remaining.append((wave, offset + frames))
         self.voices = remaining
         np.clip(output, -0.9, 0.9, out=output)
+        tap = self.tap
+        if tap is not None:
+            tap.append((monotonic(), output[:, 0].copy()))
 
     def close(self):
         if self.stream is not None:
@@ -115,11 +213,143 @@ class Audio:
             self.stream = None
 
 
+class Recorder:
+    """R toggles recording: the rendered view, the app's audio and the microphone.
+
+    Frames and audio blocks are written by one worker thread; on stop ffmpeg muxes
+    them into a single MP4 in `folder`, with each audio track offset to the video start.
+    """
+
+    FPS = 30
+    SIZE = (1280, 720)
+
+    def __init__(self, folder, audio, use_mic=True):
+        self.folder = Path(folder).expanduser()
+        self.audio = audio
+        self.use_mic = use_mic
+        self.active = False
+        self.worker = None
+        self.message, self.message_until = "", 0.0
+
+    def toggle(self, now):
+        self.stop() if self.active else self.start(now)
+
+    def start(self, now):
+        if self.worker is not None and self.worker.is_alive():
+            self.say("Poprzednie nagranie jeszcze się zapisuje", now)
+            return
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.output = self.folder / f"air-harp-{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
+        self.parts = Path(mkdtemp(prefix="air-harp-"))
+        self.frames = Queue(maxsize=self.FPS * 2)
+        self.app_blocks, self.mic_blocks = deque(), deque()
+        self.queued = self.dropped = 0
+        self.started = now
+        self.mic, self.mic_rate = None, None
+        if self.use_mic:
+            try:
+                self.mic = sd.InputStream(
+                    channels=1, dtype="float32",
+                    callback=lambda data, *_: self.mic_blocks.append((monotonic(), data[:, 0].copy())))
+                self.mic_rate = int(self.mic.samplerate)
+                self.mic.start()
+            except sd.PortAudioError as error:
+                print(f"Mikrofon niedostępny, nagrywam bez niego: {error}", flush=True)
+                self.mic = None
+        self.audio.tap = self.app_blocks
+        self.active = True
+        self.worker = Thread(target=self.write, name="air-harp-recorder", daemon=True)
+        self.worker.start()
+
+    def add_frame(self, frame, now):
+        """Queue the view so the video keeps a steady FPS timeline (repeat or skip frames)."""
+        if not self.active:
+            return
+        due = int((now - self.started) * self.FPS) + 1
+        if self.queued < due:
+            frame = frame.copy()  # The caller draws the REC badge onto its frame next.
+        while self.queued < due:
+            self.queued += 1
+            try:
+                self.frames.put_nowait(frame)
+            except Full:
+                self.dropped += 1  # Encoder fell behind: video stays in sync, just choppier.
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        self.audio.tap = None
+        if self.mic is not None:
+            self.mic.stop()
+            self.mic.close()
+        self.frames.put(None)
+        self.say("Zapisywanie nagrania…", monotonic(), seconds=60)
+
+    def say(self, text, now, seconds=5):
+        self.message, self.message_until = text, now + seconds
+
+    def write(self):
+        video = cv2.VideoWriter(str(self.parts / "video.mp4"),
+                                cv2.VideoWriter_fourcc(*"mp4v"), self.FPS, self.SIZE)
+        tracks = {"app": (self.app_blocks, self.audio.rate), "mic": (self.mic_blocks, self.mic_rate)}
+        wavs, first = {}, {}
+        frames = 0
+        while True:
+            try:
+                frame = self.frames.get(timeout=0.05)
+            except Empty:
+                frame = False
+            if frame is not None and frame is not False:
+                video.write(cv2.resize(frame, self.SIZE, interpolation=cv2.INTER_AREA))
+                frames += 1
+            for name, (blocks, rate) in tracks.items():
+                while blocks:
+                    at, block = blocks.popleft()
+                    if name not in wavs:
+                        first[name] = at - len(block) / rate  # time of the block's first sample
+                        wavs[name] = open_wav(str(self.parts / f"{name}.wav"), "wb")
+                        wavs[name].setnchannels(1)
+                        wavs[name].setsampwidth(2)
+                        wavs[name].setframerate(rate)
+                    wavs[name].writeframes((np.clip(block, -1, 1) * 32767).astype("<i2").tobytes())
+            if frame is None:
+                break
+        video.release()
+        for wav in wavs.values():
+            wav.close()
+        self.mux(frames, first)
+
+    def mux(self, frames, first):
+        command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.parts / "video.mp4")]
+        for name, start in first.items():
+            command += ["-itsoffset", f"{max(0.0, start - self.started):.3f}",
+                        "-i", str(self.parts / f"{name}.wav")]
+        inputs = "".join(f"[{index}:a]" for index in range(1, len(first) + 1))
+        if first:
+            command += ["-filter_complex",
+                        f"{inputs}amix=inputs={len(first)}:duration=longest:normalize=0[a]",
+                        "-map", "0:v", "-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+        command += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-t", f"{frames / self.FPS:.3f}", str(self.output)]
+        try:
+            run_process(command, check=True, capture_output=True, text=True)
+            self.say(f"Zapisano: {self.output.name}", monotonic(), seconds=6)
+            print(f"Nagranie zapisane: {self.output}", flush=True)
+            if self.dropped:
+                print(f"Pominięte klatki (koder nie nadążał): {self.dropped}", flush=True)
+        except (OSError, CalledProcessError) as error:
+            detail = getattr(error, "stderr", "") or error
+            self.say("Błąd zapisu nagrania (szczegóły w terminalu)", monotonic(), seconds=8)
+            print(f"ffmpeg nie złożył nagrania ({detail}). Części: {self.parts}", flush=True)
+
+
 class CameraFeed:
     """Read the webcam independently and keep only its newest frame."""
 
     def __init__(self, capture):
         self.capture = capture
+        self.on_frame = None  # Called on this thread, so tracking never waits for rendering.
         self.latest = None
         self.failed = False
         self.stop = Event()
@@ -134,8 +364,11 @@ class CameraFeed:
                 ok, image = self.capture.read()
                 if ok:
                     sequence += 1
-                    self.latest = (sequence, monotonic(), image)
+                    captured_at = monotonic()
+                    self.latest = (sequence, captured_at, image)
                     missed = 0
+                    if self.on_frame is not None:
+                        self.on_frame(image, captured_at)
                 elif missed >= 9:
                     break
                 else:
@@ -184,7 +417,9 @@ class String:
         self.note = note_for_length(distance_between(self.a, self.b))
 
     def strike(self, now, audio, contact=0.5, direction=1):
-        if now - self.struck_at >= 0.14:
+        # The cooldown only stops jitter re-hitting in the same direction; a strum
+        # coming back the other way always sounds.
+        if direction != self.direction or now - self.struck_at >= 0.14:
             self.struck_at = now
             self.contact = contact
             self.direction = direction
@@ -195,6 +430,7 @@ class String:
 class Hand:
     points: tuple[Point, ...]
     pinched: bool
+    raw_pinch: bool = False  # This frame alone looks pinched; confirmed on the next one.
 
     @property
     def tip(self):
@@ -260,7 +496,7 @@ class Harp:
             return
         hits = []
         for string in self.strings:
-            if string.phrase_step is None and distance > WIDTH * 0.20:
+            if string.phrase_step is None and distance > WIDTH * 0.45:
                 continue
             intersection = crossing(start, end, string.a, string.b)
             if intersection is None:
@@ -336,9 +572,10 @@ class Harp:
             for landmarks in result.hand_landmarks
         ]
         # Keep wrist identities through brief missed frames without drawing stale joints.
+        # Fast sweeps blur the hand out for a few frames; the bridge keeps those plucks.
         self.recent_hands = {
             slot: (seen, hand) for slot, (seen, hand) in self.recent_hands.items()
-            if now - seen <= 0.13
+            if now - seen <= 0.3
         }
         recent = {slot: hand for slot, (_, hand) in self.recent_hands.items()}
         slots = assign_hands(detections, recent)
@@ -355,7 +592,10 @@ class Harp:
                     (px + (x - px) * weight, py + (y - py) * weight)
                     for (px, py), (x, y) in zip(previous.points, points)
                 )
-            hands[slot] = Hand(points, palm > 0 and gap < palm * threshold)
+            raw = palm > 0 and gap < palm * threshold
+            # One pinched-looking frame mid-sweep must not swallow a pluck.
+            confirmed = raw and previous is not None and (previous.pinched or previous.raw_pinch)
+            hands[slot] = Hand(points, confirmed, raw)
 
         self.update_gestures(hands, now, recent)
         self.hands = hands
@@ -396,7 +636,9 @@ class Harp:
 
         for slot, hand in hands.items():
             previous = recent.get(slot)
-            if previous and not previous.pinched and not hand.pinched:
+            # Drawing (preview) and endpoint drags already return above; a curled
+            # strumming hand often reads as pinched, so pinch alone must not block.
+            if previous and self.preview is None:
                 self.pluck(previous.tip, hand.tip, now)
 
     def expire_tracking(self, now):
@@ -560,57 +802,102 @@ def draw_hand(frame, hand):
         cv2.circle(frame, points[8], 8, (226, 240, 246), 1, cv2.LINE_AA)
 
 
+@lru_cache(maxsize=None)
+def font(px):
+    """A TrueType face with Polish glyphs; OpenCV's Hershey fonts are ASCII-only."""
+    for path in FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, px)
+        except OSError:
+            pass
+    return ImageFont.load_default(px)
+
+
+@lru_cache(maxsize=512)
+def label(words, size):
+    """Cached alpha mask of the text and its offset from the left baseline point."""
+    face = font(round(size * 32))
+    left, top, right, bottom = face.getbbox(words, anchor="ls")
+    image = Image.new("L", (max(1, right - left), max(1, bottom - top)))
+    ImageDraw.Draw(image).text((-left, -top), words, fill=255, font=face, anchor="ls")
+    return np.asarray(image, dtype=np.float32)[..., None] / 255, (left, top)
+
+
+def text_size(words, size):
+    """Width and height above the baseline, like cv2.getTextSize."""
+    mask, (_, top) = label(words, size)
+    return mask.shape[1], -top
+
+
 def write(frame, words, origin, size=0.52, color=(226, 233, 245)):
-    cv2.putText(frame, words, origin, cv2.FONT_HERSHEY_SIMPLEX, size, color, 1, cv2.LINE_AA)
+    mask, (left, top) = label(words, size)
+    x, y = round(origin[0]) + left, round(origin[1]) + top
+    height, width = mask.shape[:2]
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + width, frame.shape[1]), min(y + height, frame.shape[0])
+    if x0 >= x1 or y0 >= y1:
+        return
+    alpha = mask[y0 - y:y1 - y, x0 - x:x1 - x]
+    region = frame[y0:y1, x0:x1]
+    region[:] = region * (1 - alpha) + np.array(color, np.float32) * alpha
 
 
 def render(frame, harp, now, demo, rates=""):
-    for string in harp.strings:
-        active_end = harp.drag.end if harp.drag and harp.drag.string is string else None
+    # The tracking thread mutates the harp; draw from one snapshot of it.
+    strings, hands = list(harp.strings), list(harp.hands.values())
+    drag, preview = harp.drag, harp.preview
+    for string in strings:
+        active_end = drag.end if drag and drag.string is string else None
         age = now - string.struck_at if active_end is None else None
         draw_string(frame, string.a, string.b, string.color, now, age,
                     string.contact, string.direction, active_end)
-    if harp.preview is not None:
-        a, b = harp.preview
+    if preview is not None:
+        a, b = preview
         draw_string(frame, a, b, (186, 191, 130), now)
 
-    for hand in harp.hands.values():
+    for hand in hands:
         draw_hand(frame, hand)
-    for string in harp.strings:
-        editing_b = harp.drag and harp.drag.string is string and harp.drag.end == 1
+    for string in strings:
+        editing_b = drag and drag.string is string and drag.end == 1
         draw_note(frame, string.b if editing_b else string.a, string.note,
                   beside_endpoint=string.phrase_step is not None and not editing_b)
-    if harp.preview is not None:
-        length = distance_between(*harp.preview)
+    if preview is not None:
+        length = distance_between(*preview)
         if length >= MIN_STRING:
-            draw_note(frame, harp.preview[1], note_for_length(length))
+            draw_note(frame, preview[1], note_for_length(length))
 
     top, bottom = frame[:88], frame[-60:]
     cv2.convertScaleAbs(top, dst=top, alpha=0.42)
     cv2.convertScaleAbs(bottom, dst=bottom, alpha=0.42)
-    write(frame, "AIR HARP", (36, 54), 1.2, (255, 233, 168))
-    guide = ("Drag to draw  /  Sweep to pluck  /  Drag either end to retune" if demo else
-             "Pinch both hands to draw  /  Sweep to pluck  /  Pinch or drag an end to retune")
-    show_phrase = any(string.phrase_step is not None for string in harp.strings)
-    write(frame, guide, (260, 38 if show_phrase else 53), 0.76)
+    title = "HARFA POWIETRZNA"
+    write(frame, title, (36, 54), 1.1, (255, 233, 168))
+    guide_x = 36 + text_size(title, 1.1)[0] + 48
+    guide = ("Przeciągnij: nowa struna  /  Przesuń przez strunę: dźwięk  /  "
+             "Przeciągnij koniec: strojenie" if demo else
+             "Zaciśnij palce obu dłoni i rozsuń: nowa struna  /  "
+             "Przesuń palec: dźwięk  /  Chwyć koniec: strojenie")
+    show_phrase = any(string.phrase_step is not None for string in strings)
+    write(frame, guide, (guide_x, 38 if show_phrase else 53), 0.66)
     if show_phrase:
-        write(frame, "He's a Pirate   /   Sweep down the middle and stop in any gap",
-              (260, 70), 0.68, (255, 233, 168))
-    tracking = "Mouse mode" if demo else f"Hands {len(harp.hands)}/2"
-    if not demo and not harp.hands:
-        tracking += "  /  Show your palm and wrist"
+        write(frame, "He's a Pirate  /  Przesuwaj palec w dół środkiem, "
+              "zatrzymuj się w przerwach", (guide_x, 70), 0.62, (255, 233, 168))
+    tracking = "Tryb myszy" if demo else f"Dłonie: {len(hands)}/2"
+    if not demo and not hands:
+        tracking += "  /  Pokaż dłoń z nadgarstkiem"
     write_right(frame, tracking, 37 if rates else 53)
     if rates:
         write_right(frame, rates, 69)
-    write(frame, "P  Pirate strings     F  Fullscreen     Z  Undo     C  Clear     Esc  Quit",
-          (36, HEIGHT - 22), 0.73)
-    sound = "" if harp.audio.stream is not None else "  /  Audio unavailable"
-    write_right(frame, f"E2-E6 chromatic  /  {len(harp.strings)} strings{sound}", HEIGHT - 22)
+    write(frame, "1–5  Brzmienie    R  Nagrywanie    P  Pirates    F  Pełny ekran    "
+          "Z  Cofnij    C  Wyczyść    Esc  Wyjście", (36, HEIGHT - 22), 0.66)
+    timbre = getattr(harp.audio, "timbre", 0)
+    sound = (f"{timbre + 1}  {TIMBRES[timbre][0]}" if harp.audio.stream is not None
+             else "Brak dźwięku")
+    write_right(frame, f"{sound}  /  E2–E6  /  Struny: {len(strings)}", HEIGHT - 22)
 
 
 def draw_note(frame, anchor, note, *, beside_endpoint=False):
     name = note_name(note)
-    width, height = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 1)[0]
+    width, height = text_size(name, 0.60)
     x = anchor[0] - width - 17 if beside_endpoint else anchor[0] - width / 2
     y = anchor[1] + height / 2 if beside_endpoint else anchor[1] - 14
     x = round(min(WIDTH - width - 8, max(8, x)))
@@ -621,8 +908,8 @@ def draw_note(frame, anchor, note, *, beside_endpoint=False):
 
 
 def write_right(frame, words, y):
-    width, _ = cv2.getTextSize(words, cv2.FONT_HERSHEY_SIMPLEX, 0.73, 1)[0]
-    write(frame, words, (WIDTH - width - 36, y), 0.73)
+    width, _ = text_size(words, 0.66)
+    write(frame, words, (WIDTH - width - 36, y), 0.66)
 
 
 def fit_camera_view(width, height):
@@ -642,14 +929,15 @@ def camera_preview(image, viewport):
     return frame
 
 
-def create_tracker(results):
+def create_tracker(handle):
+    """Run hand tracking; `handle(captured_at, result)` fires on MediaPipe's thread."""
     import mediapipe as mp
 
     if not MODEL.is_file():
         raise RuntimeError(f"Missing hand tracking model: {MODEL}. See README.md for setup.")
 
     def on_result(result, _image, timestamp):
-        results.append((timestamp / 1000, result))
+        handle(timestamp / 1000, result)
 
     vision = mp.tasks.vision
     options = vision.HandLandmarkerOptions(
@@ -657,11 +945,42 @@ def create_tracker(results):
         running_mode=vision.RunningMode.LIVE_STREAM,
         num_hands=2,
         min_hand_detection_confidence=0.35,
-        min_hand_presence_confidence=0.35,
-        min_tracking_confidence=0.45,
+        min_hand_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
         result_callback=on_result,
     )
     return vision.HandLandmarker.create_from_options(options), mp
+
+
+def frame_tracker(detector, mp, shared):
+    """Feed each camera frame to the detector straight from the camera thread."""
+    last_timestamp = -1
+
+    def track(image, captured_at):
+        nonlocal last_timestamp
+        height, width = image.shape[:2]
+        shared["viewport"] = fit_camera_view(width, height)
+        scale = min(1, 640 / max(width, height))
+        small = cv2.resize(image, (round(width * scale), round(height * scale)),
+                           interpolation=cv2.INTER_AREA) if scale < 1 else image
+        rgb = cv2.cvtColor(cv2.flip(small, 1), cv2.COLOR_BGR2RGB)
+        last_timestamp = max(last_timestamp + 1, int(captured_at * 1000))
+        detector.detect_async(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
+                              last_timestamp)
+
+    return track
+
+
+def open_any_camera(preferred, skip=()):
+    """Open the preferred camera, else the first other index that works."""
+    for index in dict.fromkeys((preferred, *CAMERA_SCAN)):
+        if index not in skip:
+            feed = open_camera(index)
+            if feed is not None:
+                if index != preferred:
+                    print(f"Kamera {preferred} niedostępna, używam kamery {index}.", flush=True)
+                return feed, index
+    return None, preferred
 
 
 def open_camera(index, fast_mode=True):
@@ -678,7 +997,20 @@ def open_camera(index, fast_mode=True):
     return CameraFeed(camera)
 
 
-def run(harp, camera_index, demo, fullscreen=True):
+def draw_recording(frame, recorder, now):
+    """Drawn after the frame is captured, so the badge never ends up in the video."""
+    x, y = WIDTH // 2 + 40, HEIGHT - 22
+    if recorder.active:
+        elapsed = int(now - recorder.started)
+        if int(now * 2) % 2 == 0:
+            cv2.circle(frame, (x, y - 8), 9, (40, 40, 230), -1, cv2.LINE_AA)
+        write(frame, f"NAGRYWANIE  {elapsed // 60:02d}:{elapsed % 60:02d}", (x + 20, y), 0.66,
+              (120, 120, 255))
+    elif now < recorder.message_until:
+        write(frame, recorder.message, (x, y), 0.66, (255, 233, 168))
+
+
+def run(harp, camera_index, demo, fullscreen=True, log_path=None, recorder=None):
     feed = None
     detector = None
     try:
@@ -687,21 +1019,50 @@ def run(harp, camera_index, demo, fullscreen=True):
         cv2.imshow(WINDOW, np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8))
         cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN,
                               cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        failed_cameras = set()
         if not demo:
-            feed = open_camera(camera_index)
+            feed, camera_index = open_any_camera(camera_index)
             if feed is None:
                 demo = True
-                print(f"Webcam {camera_index} unavailable. Starting mouse mode.")
-        results = deque(maxlen=8)
-        if feed is not None:
-            detector, mp = create_tracker(results)
+                print("Brak dostępnej kamery. Uruchamiam tryb myszy.")
+        # Plucks fire on MediaPipe's thread the moment a result lands; the lock keeps
+        # them from interleaving with keyboard, mouse and timeout updates.
+        lock = Lock()
+        shared = {"viewport": (0, 0, WIDTH, HEIGHT), "tracked": 0, "demo": demo}
 
-        cv2.setMouseCallback(WINDOW, harp.mouse_event, demo)
+        log = open(log_path, "w", buffering=1) if log_path else None
+        if log:
+            log.write("captured,handled,hands,raw_detections,tip_x,tip_y,pinched,strikes\n")
+
+        def on_tracked(captured_at, result):
+            with lock:
+                shared["tracked"] += 1
+                if not shared["demo"]:
+                    harp.update_hands(result, captured_at, shared["viewport"])
+                if log:
+                    hand = harp.hands.get(0) or next(iter(harp.hands.values()), None)
+                    tip = hand.tip if hand else ("", "")
+                    strikes = sum(s.struck_at == captured_at for s in harp.strings)
+                    log.write(f"{captured_at:.4f},{monotonic():.4f},{len(harp.hands)},"
+                              f"{len(result.hand_landmarks)},{tip[0]:.0f},{tip[1]:.0f},"
+                              f"{int(bool(hand and hand.pinched))},{strikes}\n"
+                              if hand else
+                              f"{captured_at:.4f},{monotonic():.4f},0,"
+                              f"{len(result.hand_landmarks)},,,0,0\n")
+
+        def on_mouse(event, x, y, flags, mouse_demo):
+            with lock:
+                harp.mouse_event(event, x, y, flags, mouse_demo)
+
+        if feed is not None:
+            detector, mp = create_tracker(on_tracked)
+            feed.on_frame = frame_tracker(detector, mp, shared)
+
+        cv2.setMouseCallback(WINDOW, on_mouse, demo)
 
         background = np.full((HEIGHT, WIDTH, 3), (39, 24, 22), dtype=np.uint8)
         viewport = (0, 0, WIDTH, HEIGHT)
         last_sequence = None
-        last_timestamp = -1
         measured_at = monotonic()
         camera_frames = tracking_frames = view_frames = 0
         rates = ""
@@ -714,14 +1075,24 @@ def run(harp, camera_index, demo, fullscreen=True):
                 feed = open_camera(camera_index, fast_mode=False) if retry_default else None
                 tried_default_camera_mode = True
                 if feed is None:
-                    print(f"Webcam {camera_index} stopped supplying frames. Starting mouse mode.")
+                    # The camera vanished (e.g. the iPhone disconnected): try the others.
+                    failed_cameras.add(camera_index)
+                    feed, camera_index = open_any_camera(camera_index, failed_cameras)
+                    tried_default_camera_mode = False
+                    with lock:
+                        harp.reset_tracking(monotonic())
+                if feed is not None:
+                    feed.on_frame = frame_tracker(detector, mp, shared)
+                else:
+                    print("Żadna kamera nie dostarcza obrazu. Uruchamiam tryb myszy.")
                     detector.close()
                     detector = None
-                    harp.reset_tracking(monotonic())
-                    demo = True
+                    with lock:
+                        shared["demo"] = demo = True
+                        harp.reset_tracking(monotonic())
                     background.fill(24)
                     rates = ""
-                    cv2.setMouseCallback(WINDOW, harp.mouse_event, True)
+                    cv2.setMouseCallback(WINDOW, on_mouse, True)
 
             latest = feed.latest if feed is not None else None
             if latest is not None and latest[0] != last_sequence:
@@ -733,35 +1104,34 @@ def run(harp, camera_index, demo, fullscreen=True):
                 height, width = image.shape[:2]
                 viewport = fit_camera_view(width, height)
                 background = camera_preview(image, viewport)
-                scale = min(1, 800 / max(width, height))
-                tracking = cv2.resize(image, (round(width * scale), round(height * scale)),
-                                      interpolation=cv2.INTER_AREA) if scale < 1 else image
-                rgb = cv2.cvtColor(tracking, cv2.COLOR_BGR2RGB)
-                last_timestamp = max(last_timestamp + 1, int(captured_at * 1000))
-                detector.detect_async(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
-                                      last_timestamp)
 
             now = monotonic()
-            for _ in range(len(results)):
-                captured_at, result = results.popleft()
-                tracking_frames += 1
-                if not demo and now - captured_at < 0.25:
-                    harp.update_hands(result, captured_at, viewport)
-            harp.expire_tracking(now)
-            harp.audition_drag(now)
+            with lock:
+                tracking_frames += shared["tracked"]
+                shared["tracked"] = 0
+                harp.expire_tracking(now)
+                harp.audition_drag(now)
             if now - measured_at >= 1:
                 elapsed = now - measured_at
-                rates = (f"Cam {camera_frames / elapsed:.0f}  Track {tracking_frames / elapsed:.0f}  "
-                         f"View {view_frames / elapsed:.0f} fps") if not demo else ""
+                rates = (f"Kamera {camera_frames / elapsed:.0f}  "
+                         f"Śledzenie {tracking_frames / elapsed:.0f}  "
+                         f"Obraz {view_frames / elapsed:.0f} kl./s") if not demo else ""
+                if log and rates:
+                    log.write(f"# {now:.4f} {rates}\n")
                 measured_at = now
                 camera_frames = tracking_frames = view_frames = 0
             frame = background.copy()
             render(frame, harp, now, demo, rates)
+            if recorder is not None:
+                recorder.add_frame(frame, now)
+                draw_recording(frame, recorder, now)
             cv2.imshow(WINDOW, frame)
             view_frames += 1
             key = cv2.pollKey() & 0xFF
             if key in (27, ord("q"), ord("Q")) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                 break
+            if key in (ord("r"), ord("R")) and recorder is not None:
+                recorder.toggle(monotonic())
             if key in (ord("f"), ord("F")):
                 if fullscreen:
                     x, y, width, height = cv2.getWindowImageRect(WINDOW)
@@ -772,38 +1142,57 @@ def run(harp, camera_index, demo, fullscreen=True):
                 else:
                     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
                 fullscreen = not fullscreen
-            if key in (ord("c"), ord("C")):
-                if harp.drag is not None:
-                    harp.finish_drag(now, commit=False)
-                harp.strings.clear()
-            if key in (ord("z"), ord("Z")) and harp.strings:
-                if harp.drag is not None:
-                    harp.finish_drag(now, commit=False)
-                harp.strings.pop()
-            if key in (ord("p"), ord("P")) and harp.drag is None:
-                harp.load_pirate_notes()
+            with lock:
+                if key in (ord("c"), ord("C")):
+                    if harp.drag is not None:
+                        harp.finish_drag(now, commit=False)
+                    harp.strings.clear()
+                if key in (ord("z"), ord("Z")) and harp.strings:
+                    if harp.drag is not None:
+                        harp.finish_drag(now, commit=False)
+                    harp.strings.pop()
+                if key in (ord("p"), ord("P")) and harp.drag is None:
+                    harp.load_pirate_notes()
+                if ord("1") <= key < ord("1") + len(TIMBRES):
+                    harp.audio.timbre = key - ord("1")
             remaining = VIEW_FRAME_INTERVAL - (monotonic() - frame_started)
             if remaining > 0:
                 sleep(remaining)
     finally:
-        if detector is not None:
-            detector.close()
+        if recorder is not None:
+            recorder.stop()  # Quitting mid-take still saves it.
+            if recorder.worker is not None:
+                print("Zapisuję nagranie…", flush=True)
+                recorder.worker.join()
+        # Stop the camera thread first: it is the one feeding the detector.
         if feed is not None:
             feed.close()
+        if detector is not None:
+            detector.close()
         cv2.destroyAllWindows()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--camera", default=0, type=int, help="Webcam index (default: 0)")
+    parser.add_argument("--camera", default=1, type=int,
+                        help="Preferred camera index; falls back to the next working one "
+                             "(default: 1, the iPhone on this Mac)")
     parser.add_argument("--demo", action="store_true", help="Play with the mouse without a webcam")
-    parser.add_argument("--windowed", action="store_true", help="Start in a resizable window")
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="Start fullscreen (default: resizable window)")
+    parser.add_argument("--log", help="Write one CSV row per tracking result to this file")
+    parser.add_argument("--record-dir", default="~/Movies/Air Harp",
+                        help="Where R saves recordings (default: ~/Movies/Air Harp)")
+    parser.add_argument("--no-mic", action="store_true",
+                        help="Record only the app's sound, without the microphone")
     args = parser.parse_args()
     audio = Audio()
     try:
         harp = Harp(audio)
         harp.load_pirate_notes()
-        run(harp, args.camera, args.demo, fullscreen=not args.windowed)
+        recorder = Recorder(args.record_dir, audio, use_mic=not args.no_mic)
+        run(harp, args.camera, args.demo, fullscreen=args.fullscreen, log_path=args.log,
+            recorder=recorder)
     except (RuntimeError, cv2.error) as error:
         parser.exit(1, f"Air Harp: {error}\n")
     except KeyboardInterrupt:
